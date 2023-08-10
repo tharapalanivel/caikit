@@ -28,7 +28,8 @@ model_management:
                       config: {}
 """
 # Standard
-from typing import Callable, Optional
+from typing import Callable, List, Optional
+import copy
 import inspect
 
 # First Party
@@ -36,6 +37,7 @@ import aconfig
 import alog
 
 # Local
+from ..exceptions import error_handler
 from ..module_backends import BackendBase, backend_types
 from ..modules import ModuleBase, ModuleConfig
 from ..modules.decorator import SUPPORTED_LOAD_BACKENDS_VAR_NAME
@@ -44,7 +46,6 @@ from ..registries import (
     module_backend_registry,
     module_backend_types,
 )
-from ..toolkit.errors import error_handler
 from .model_initializer_base import ModelInitializerBase
 
 log = alog.use_channel("LLOAD")
@@ -177,13 +178,29 @@ class LocalModelInitializer(ModelInitializerBase):
                     module_backend_impl.__name__,
                 )
                 extra_kwargs = {}
-                if self._supports_load_backend_kwarg(module_backend_impl.load):
+                if self._supports_arg(module_backend_impl.load, "load_backend"):
                     extra_kwargs["load_backend"] = load_backend
-                loaded_model = module_backend_impl.load(
-                    model_path,
-                    **extra_kwargs,
-                    **kwargs,
-                )
+                # Try loading with the ModuleConfig directly and fall back to
+                # loading with the model_path for compatibility
+                try:
+                    loaded_model = module_backend_impl.load(
+                        model_config,
+                        **extra_kwargs,
+                        **kwargs,
+                    )
+                except TypeError as err:
+                    log.warning(
+                        "<COR98539580W>",
+                        "DEPRECATION: Loading %s failed with ModuleConfig. Using model_path. %s",
+                        module_backend_impl.MODULE_ID,
+                        err,
+                    )
+                    loaded_model = module_backend_impl.load(
+                        model_path,
+                        **extra_kwargs,
+                        **kwargs,
+                    )
+
                 error.type_check("<COR40080753E>", ModuleBase, model=loaded_model)
                 if loaded_model is not None:
                     log.debug2(
@@ -197,15 +214,20 @@ class LocalModelInitializer(ModelInitializerBase):
         # Return the loaded model if it was able to load
         return loaded_model
 
+    @property
+    def backends(self) -> List[BackendBase]:
+        """Return an immutable view of the priority sequence of backends"""
+        return copy.copy(self._backends)
+
     ## Implementation Details ##################################################
 
     @staticmethod
-    def _supports_load_backend_kwarg(load_fn: Callable) -> bool:
+    def _supports_arg(load_fn: Callable, arg_name: str) -> bool:
         """A load function supports the load_backend kwarg IFF it has an arg
         explicitly named load_backend or it has a ** kwarg capture
         """
         sig = inspect.signature(load_fn)
-        return "load_backend" in sig.parameters
+        return arg_name in sig.parameters
 
     def _get_supported_load_backends(self, backend_impl: ModuleBase):
         """Function to get a list of supported load backends

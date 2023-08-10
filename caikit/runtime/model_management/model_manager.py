@@ -30,7 +30,7 @@ import alog
 # Local
 from caikit import get_config
 from caikit.core import ModuleBase
-from caikit.core.toolkit.errors import error_handler
+from caikit.core.exceptions import error_handler
 from caikit.runtime.model_management.loaded_model import LoadedModel
 from caikit.runtime.model_management.model_loader import ModelLoader
 from caikit.runtime.model_management.model_sizer import ModelSizer
@@ -157,6 +157,7 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
         model_type: str,
         wait: bool = True,
         aborter: Optional[ActionAborter] = None,
+        retries: Optional[int] = None,
     ) -> int:
         """Load a model using model_path (in Cloud Object Storage) & give it a model ID
         Args:
@@ -164,6 +165,8 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
             local_model_path (str): Local path to load the model from.
             model_type (str): Type of the model to load.
             wait (bool): Wait for the model to finish loading
+            aborter (Optional[ActionAborter]): The aborter to use for this load
+            retries: Optional[int]: Number of times to retry on load failure
         Returns:
             Model_size (int) : Size of the loaded model in bytes
         """
@@ -191,15 +194,23 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
                             model_type,
                             aborter=aborter,
                             fail_callback=partial(self.unload_model, model_id),
+                            retries=retries,
                         )
                     except Exception as ex:
                         self.__increment_load_model_exception_count_metric(model_type)
                         raise ex
 
                     # Estimate the model's size and update the LoadedModel
-                    model_size = self.model_sizer.get_model_size(
-                        model_id, local_model_path, model_type
-                    )
+                    try:
+                        model_size = self.model_sizer.get_model_size(
+                            model_id, local_model_path, model_type
+                        )
+                    except CaikitRuntimeException:
+                        log.debug(
+                            "Unable to estimate model size for non-disk model: %s",
+                            model_id,
+                        )
+                        model_size = 0
                     model.set_size(model_size)
 
                     # Add model + helpful metadata to our loaded models map
@@ -367,17 +378,17 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
         model_loaded = model_id in self.loaded_models
         if not model_loaded and self._lazy_load_local_models:
             local_model_path = os.path.join(self._local_models_dir, model_id)
-            if os.path.exists(local_model_path):
-                log.debug2(
-                    "Lazy loading local model %s from %s", model_id, local_model_path
-                )
-                self.load_model(
-                    model_id=model_id,
-                    local_model_path=local_model_path,
-                    model_type=self._LOCAL_MODEL_TYPE,
-                    wait=True,
-                )
-                model_loaded = True
+            log.debug2(
+                "Lazy loading local model %s from %s", model_id, local_model_path
+            )
+            self.load_model(
+                model_id=model_id,
+                local_model_path=local_model_path,
+                model_type=self._LOCAL_MODEL_TYPE,
+                wait=True,
+                retries=get_config().runtime.lazy_load_retries,
+            )
+            model_loaded = True
 
         # If still not loaded, there's nothing to find, so raise NOT_FOUND
         if not model_loaded:
@@ -434,7 +445,13 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
         # Load new models
         for model_id in new_models:
             model_path = os.path.join(self._local_models_dir, model_id)
-            self.load_model(model_id, model_path, self._LOCAL_MODEL_TYPE, wait=False)
+            self.load_model(
+                model_id,
+                model_path,
+                self._LOCAL_MODEL_TYPE,
+                wait=False,
+                retries=get_config().runtime.lazy_load_retries,
+            )
 
         # Unload old models
         # NOTE: No need for error handling here since unload_model will warn on

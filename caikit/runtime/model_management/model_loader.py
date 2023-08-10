@@ -13,6 +13,7 @@
 # limitations under the License.
 # Standard
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import Callable, Optional, Union
 
 # Third Party
@@ -24,7 +25,7 @@ import alog
 
 # Local
 from caikit.config import get_config
-from caikit.core import MODEL_MANAGER
+from caikit.core import MODEL_MANAGER, ModuleBase
 from caikit.runtime.model_management.batcher import Batcher
 from caikit.runtime.model_management.loaded_model import LoadedModel
 from caikit.runtime.types.caikit_runtime_exception import CaikitRuntimeException
@@ -32,7 +33,6 @@ from caikit.runtime.work_management.abortable_action import (
     AbortableAction,
     ActionAborter,
 )
-import caikit.core
 
 log = alog.use_channel("MODEL-LOADER")
 
@@ -65,6 +65,7 @@ class ModelLoader:
         model_type: str,
         aborter: Optional[ActionAborter] = None,
         fail_callback: Optional[Callable] = None,
+        retries: int = 0,
     ) -> LoadedModel:
         """Start loading a model from disk and associate the ID/size with it
 
@@ -76,6 +77,7 @@ class ModelLoader:
                 the call's parent to abort the load
             fail_callback (Optional[Callable]): Optional no-arg callback to call
                 on load failure
+            retries (int): Number of times to retry loading
         Returns:
             model (LoadedModel) : The model that was loaded
         """
@@ -86,6 +88,7 @@ class ModelLoader:
             .type(model_type)
             .path(local_model_path)
             .fail_callback(fail_callback)
+            .retries(retries)
         )
 
         # Set up the async loading
@@ -94,10 +97,12 @@ class ModelLoader:
         if aborter is not None:
             log.debug3("Using abortable action to load %s", model_id)
             action = AbortableAction(aborter, self._load_module, *args)
-            future = self._load_thread_pool.submit(action.do)
+            future_factory = partial(self._load_thread_pool.submit, action.do)
         else:
-            future = self._load_thread_pool.submit(self._load_module, *args)
-        model_builder.model_future(future)
+            future_factory = partial(
+                self._load_thread_pool.submit, self._load_module, *args
+            )
+        model_builder.model_future_factory(future_factory)
 
         # Return the built model with the future handle
         return model_builder.build()
@@ -110,7 +115,7 @@ class ModelLoader:
 
             # Load using the caikit.core
             with CAIKIT_CORE_LOAD_DURATION_SUMMARY.labels(model_type=model_type).time():
-                model = caikit.core.load(model_path)
+                model = MODEL_MANAGER.load(model_path)
 
             # If this model needs batching, configure a Batcher to wrap it
             model = self._wrap_in_batcher_if_configured(
@@ -157,10 +162,10 @@ class ModelLoader:
 
     def _wrap_in_batcher_if_configured(
         self,
-        caikit_core_model: caikit.core.ModuleBase,
+        caikit_core_model: ModuleBase,
         model_type: str,
         model_id: str,
-    ) -> Union[Batcher, caikit.core.ModuleBase]:
+    ) -> Union[Batcher, ModuleBase]:
         """Perform Batcher wrapping on the given module if configured, otherwise
         return the model as is
         """

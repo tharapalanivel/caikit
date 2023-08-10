@@ -4,7 +4,7 @@ This sets up global test configs when pytest starts
 
 # Standard
 from contextlib import contextmanager
-from typing import List, Union
+from typing import Callable, List, Union
 from unittest.mock import patch
 import copy
 import json
@@ -49,12 +49,29 @@ def test_environment():
     """The most important fixture: This runs caikit configuration with the base test config overrides"""
     test_config_path = os.path.join(FIXTURES_DIR, "config", "config.yml")
     caikit.configure(test_config_path)
-    # import the mock backend that is specified in the config
-    # This is required to run any test that loads a model
-    # Local
-    from tests.core.helpers import MockBackend
+    with tempfile.TemporaryDirectory() as workdir:
+        # 🌶️ All tests need to clean up after themselves! The metering and
+        # training output directories are the one thing easily creates leftover
+        # files, so we explicitly update config here to point them at a temp dir
+        with temp_config(
+            {
+                "runtime": {
+                    "metering": {
+                        "log_dir": os.path.join(workdir, "metering_logs"),
+                    },
+                    "training": {
+                        "output_dir": os.path.join(workdir, "training_output"),
+                    },
+                }
+            },
+            "merge",
+        ):
+            # import the mock backend that is specified in the config
+            # This is required to run any test that loads a model
+            # Local
+            from tests.core.helpers import MockBackend
 
-    yield
+            yield
     # No cleanup required...?
 
 
@@ -183,6 +200,26 @@ def backend_priority(backend_cfg: Union[List[dict], dict]):
         }
     ):
         yield
+
+
+class TempFailWrapper:
+    """Helper that can wrap a callable with a sequence of failures"""
+
+    def __init__(
+        self,
+        func: Callable,
+        num_failures: int = 1,
+        exc: Exception = RuntimeError("Yikes"),
+    ):
+        self.func = func
+        self.num_failures = num_failures
+        self.exc = exc
+
+    def __call__(self, *args, **kwargs):
+        if self.num_failures:
+            self.num_failures -= 1
+            raise self.exc
+        return self.func(*args, **kwargs)
 
 
 # IMPLEMENTATION DETAILS ############################################################

@@ -14,6 +14,7 @@
 # Standard
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
+from functools import partial
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 import os
@@ -27,13 +28,16 @@ import pytest
 
 # Local
 from caikit import get_config
+from caikit.core.model_manager import ModelManager as CoreModelManager
 from caikit.core.modules import ModuleBase
 from caikit.runtime.model_management.loaded_model import LoadedModel
 from caikit.runtime.model_management.model_manager import ModelManager
 from caikit.runtime.types.caikit_runtime_exception import CaikitRuntimeException
 from caikit.runtime.utils.import_util import get_dynamic_module
-from tests.conftest import random_test_id, temp_config
+from tests.conftest import TempFailWrapper, random_test_id, temp_config
+from tests.core.helpers import TestFinder
 from tests.fixtures import Fixtures
+import caikit.runtime.model_management.model_loader
 
 get_dynamic_module("caikit.core")
 ANY_MODEL_TYPE = "test-any-model-type"
@@ -58,16 +62,20 @@ def temp_local_models_dir(workdir, model_manager=MODEL_MANAGER):
 @contextmanager
 def non_singleton_model_managers(num_mgrs=1, *args, **kwargs):
     with temp_config(*args, **kwargs):
-        instances = []
-        try:
-            for _ in range(num_mgrs):
-                ModelManager._ModelManager__instance = None
-                instances.append(ModelManager.get_instance())
-            yield instances
-        finally:
-            for inst in instances:
-                inst.shut_down()
-            ModelManager._ModelManager__instance = MODEL_MANAGER
+        with patch(
+            "caikit.runtime.model_management.model_loader.MODEL_MANAGER",
+            new_callable=CoreModelManager,
+        ):
+            instances = []
+            try:
+                for _ in range(num_mgrs):
+                    ModelManager._ModelManager__instance = None
+                    instances.append(ModelManager.get_instance())
+                yield instances
+            finally:
+                for inst in instances:
+                    inst.shut_down()
+                ModelManager._ModelManager__instance = MODEL_MANAGER
 
 
 class SlowLoader:
@@ -533,6 +541,27 @@ def test_load_local_model_deleted_dir():
             assert not manager.loaded_models
 
 
+def test_load_local_model_not_on_disk():
+    """Make sure bad models in local_models_dir at boot don't cause exceptions"""
+    with TemporaryDirectory() as cache_dir:
+        with non_singleton_model_managers(
+            1,
+            {
+                "model_management": {"finders": {"default": {"type": TestFinder.name}}},
+                "runtime": {
+                    "local_models_dir": cache_dir,
+                    "lazy_load_local_models": True,
+                },
+            },
+            "merge",
+        ) as managers:
+            manager = managers[0]
+            model_id = random_test_id()
+            manager.load_model(model_id, "some_non_disk_model", "test")
+            model = manager.retrieve_model(model_id)
+            assert model
+
+
 # ****************************** Unit Tests ****************************** #
 # These tests patch in mocks for the manager's dependencies, to test its code in isolation
 
@@ -598,9 +627,10 @@ def test_retrieve_model_returns_the_module_from_the_model_loader():
             mock_sizer.get_model_size.return_value = 1
             model_future = Future()
             model_future.result = lambda *_, **__: expected_module
+            model_future_factory = lambda: model_future
             mock_loader.load_model.return_value = (
                 LoadedModel.Builder()
-                .model_future(model_future)
+                .model_future_factory(model_future_factory)
                 .id("foo")
                 .type("bar")
                 .build()
@@ -619,7 +649,7 @@ def test_unload_partially_loaded():
     # completed successfully
     slow_loader = SlowLoader()
     pool = ThreadPoolExecutor()
-    model_future = pool.submit(slow_loader.load)
+    model_future_factory = partial(pool.submit, slow_loader.load)
 
     model_id = random_test_id()
     mock_sizer = MagicMock()
@@ -629,7 +659,7 @@ def test_unload_partially_loaded():
             mock_sizer.get_model_size.return_value = 1
             mock_loader.load_model.return_value = (
                 LoadedModel.Builder()
-                .model_future(model_future)
+                .model_future_factory(model_future_factory)
                 .id("foo")
                 .type("bar")
                 .build()
@@ -658,7 +688,7 @@ def test_unload_unexpected_error_loaded():
     # completed successfully
     slow_loader = SlowLoader(RuntimeError("yikes"))
     pool = ThreadPoolExecutor()
-    model_future = pool.submit(slow_loader.load)
+    model_future_factory = partial(pool.submit, slow_loader.load)
 
     model_id = random_test_id()
     mock_sizer = MagicMock()
@@ -668,7 +698,7 @@ def test_unload_unexpected_error_loaded():
             mock_sizer.get_model_size.return_value = 1
             mock_loader.load_model.return_value = (
                 LoadedModel.Builder()
-                .model_future(model_future)
+                .model_future_factory(model_future_factory)
                 .id("foo")
                 .type("bar")
                 .build()
@@ -699,7 +729,7 @@ def test_reload_partially_loaded():
     # completed successfully
     slow_loader = SlowLoader()
     pool = ThreadPoolExecutor()
-    model_future = pool.submit(slow_loader.load)
+    model_future_factory = partial(pool.submit, slow_loader.load)
 
     model_id = random_test_id()
     mock_sizer = MagicMock()
@@ -708,13 +738,14 @@ def test_reload_partially_loaded():
     with patch.object(MODEL_MANAGER, "model_loader", mock_loader):
         with patch.object(MODEL_MANAGER, "model_sizer", mock_sizer):
             mock_sizer.get_model_size.return_value = special_model_size
-            mock_loader.load_model.return_value = (
+            loaded_model = (
                 LoadedModel.Builder()
-                .model_future(model_future)
+                .model_future_factory(model_future_factory)
                 .id("foo")
                 .type("bar")
                 .build()
             )
+            mock_loader.load_model.return_value = loaded_model
             model_size = MODEL_MANAGER.load_model(
                 model_id, ANY_MODEL_PATH, ANY_MODEL_TYPE, wait=False
             )
@@ -729,7 +760,7 @@ def test_reload_partially_loaded():
             # Unblock the load
             assert not slow_loader.done_loading()
             slow_loader.unblock_load()
-            model_future.result()
+            loaded_model.wait()
             assert slow_loader.done_loading()
 
 
@@ -807,3 +838,77 @@ def test_periodic_sync_handles_errors():
                 manager.sync_local_models(True)
                 mock_sync.assert_called_once()
                 assert manager._lazy_sync_timer is not None
+
+
+def test_periodic_sync_handles_temporary_errors():
+    """Test that models loaded with the periodic sync can retry if the initial
+    load operation fails
+    """
+    with TemporaryDirectory() as cache_dir:
+        with non_singleton_model_managers(
+            1,
+            {
+                "runtime": {
+                    "local_models_dir": cache_dir,
+                    "lazy_load_local_models": True,
+                    "lazy_load_retries": 1,
+                },
+            },
+            "merge",
+        ) as managers:
+            manager = managers[0]
+            flakey_loader = TempFailWrapper(
+                manager.model_loader._load_module,
+                num_failures=1,
+                exc=CaikitRuntimeException(grpc.StatusCode.INTERNAL, "Dang"),
+            )
+            with patch.object(
+                manager.model_loader,
+                "_load_module",
+                flakey_loader,
+            ):
+                assert manager._lazy_sync_timer is not None
+                model_path = Fixtures.get_good_model_path()
+                model_name = os.path.basename(model_path)
+                shutil.copytree(model_path, os.path.join(cache_dir, model_name))
+                manager.sync_local_models(True)
+                assert manager._lazy_sync_timer is not None
+                model = manager.retrieve_model(model_name)
+                assert model
+
+
+def test_lazy_load_handles_temporary_errors():
+    """Test that a lazy load without a periodic sync correctly retries failed
+    loads
+    """
+    with TemporaryDirectory() as cache_dir:
+        with non_singleton_model_managers(
+            1,
+            {
+                "runtime": {
+                    "local_models_dir": cache_dir,
+                    "lazy_load_local_models": True,
+                    "lazy_load_poll_period_seconds": 0,
+                    "lazy_load_retries": 1,
+                },
+            },
+            "merge",
+        ) as managers:
+            manager = managers[0]
+            flakey_loader = TempFailWrapper(
+                manager.model_loader._load_module,
+                num_failures=1,
+                exc=CaikitRuntimeException(grpc.StatusCode.INTERNAL, "Dang"),
+            )
+            with patch.object(
+                manager.model_loader,
+                "_load_module",
+                flakey_loader,
+            ):
+                assert manager._lazy_sync_timer is None
+                model_path = Fixtures.get_good_model_path()
+                model_name = os.path.basename(model_path)
+                shutil.copytree(model_path, os.path.join(cache_dir, model_name))
+                assert manager._lazy_sync_timer is None
+                model = manager.retrieve_model(model_name)
+                assert model

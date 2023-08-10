@@ -28,9 +28,10 @@ import pytest
 import aconfig
 
 # Local
+from caikit.config import get_config
 from caikit.core.data_model import DataStream, TrainingStatus
+from caikit.core.exceptions.caikit_core_exception import CaikitCoreException
 from caikit.core.model_management.local_model_trainer import LocalModelTrainer
-from caikit.core.toolkit.destroyable_process import OOM_EXIT_CODE
 from sample_lib.modules import SampleModule
 
 ## Helpers #####################################################################
@@ -53,7 +54,12 @@ def save_path():
 
 
 def get_event(cfg: dict):
-    return cfg.get("use_subprocess") and multiprocessing.Event() or threading.Event()
+    if cfg.get("use_subprocess"):
+        start_method = (
+            get_config().model_management.trainers.default.config.subprocess_start_method
+        )
+        return multiprocessing.get_context(start_method).Event()
+    return threading.Event()
 
 
 ## Tests #######################################################################
@@ -223,7 +229,7 @@ def test_purge_retention_time(trainer_type_cfg):
     retrieved_future = trainer.get_model_future(model_future.id)
     assert retrieved_future is model_future
     model_future._completion_time = model_future._completion_time - timedelta(days=2)
-    with pytest.raises(ValueError):
+    with pytest.raises(CaikitCoreException):
         trainer.get_model_future(model_future.id)
 
 

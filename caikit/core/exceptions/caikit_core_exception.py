@@ -11,18 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-
-"""Contains many helpers, utilities, and commonly re-used code in the `caikit.core` library. Users
-may find helpful methods in here for more advanced use of this library.
 """
-# Local
-from . import compatibility, logging
-from .fileio import *
-from .quality_evaluation import (
-    EvalTypes,
-    F1Metrics,
-    F1MetricsContainer,
-    QualityEvaluator,
-)
-from .serializers import *
+Caikit Core Exception enum used for reporting Exception status raised in caikit core
+"""
+
+# Standard
+from enum import Enum
+
+
+class CaikitCoreStatusCode(Enum):
+    NOT_FOUND = 1
+    INVALID_ARGUMENT = 2
+    CONNECTION_ERROR = 3
+    UNAUTHORIZED = 4
+    FORBIDDEN = 5
+    UNKNOWN = 6
+    FATAL = 7
+
+
+class CaikitCoreException(Exception):
+    status_code: CaikitCoreStatusCode
+    message: str
+
+    def __init__(self, status_code: CaikitCoreStatusCode, message: str) -> None:
+        self.status_code = status_code
+        self.message = message

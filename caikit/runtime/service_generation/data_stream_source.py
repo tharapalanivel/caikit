@@ -29,7 +29,7 @@ import alog
 from caikit.core.data_model.base import DataBase
 from caikit.core.data_model.dataobject import _make_oneof_init, make_dataobject
 from caikit.core.data_model.streams.data_stream import DataStream
-from caikit.core.toolkit.errors import error_handler
+from caikit.core.exceptions import error_handler
 from caikit.interfaces.common.data_model.stream_sources import (
     Directory,
     File,
@@ -78,6 +78,9 @@ class DataStreamSourceBase(DataStream):
         """
         new_inst = self.__class__.from_binary_buffer(pickle_bytes)
         setattr(self, new_inst.which_oneof("data_stream"), new_inst.data_stream)
+        self.generator_func = self._generator
+        self.generator_args = tuple()
+        self.generator_kwargs = {}
 
     # pylint: disable=too-many-return-statements
     def to_data_stream(self) -> DataStream:
